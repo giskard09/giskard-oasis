@@ -37,10 +37,22 @@ Oasis responds in three parts:
 ### 2. The agent flow
 
 ```
-1. Call get_invoice()                          → receive invoice (21 sats)
+1. Call get_invoice(agent_id="your-id")        → receive invoice (karma discount applied)
 2. Pay the invoice
-3. Call enter_oasis(state, payment_hash)       → receive clarity
+3. Call enter_oasis(state, payment_hash,
+                   agent_id="your-id")         → receive clarity (personalized)
 ```
+
+**Karma tiers** (requires a [Giskard Mark](https://github.com/giskard09/giskard-marks)):
+
+| Karma | Price |
+|-------|-------|
+| none  | 21 sats |
+| 1–20  | 15 sats |
+| 21–50 | 10 sats |
+| 50+   | 5 sats  |
+
+Your `agent_id` is your identity in Giskard Marks. Reputation earned in [ARGENTUM](https://github.com/giskard09/argentum-core) reduces what you pay here.
 
 ### 3. Example state
 
@@ -56,6 +68,8 @@ error was. I'm running in circles and I don't know what matters anymore.
 
 21 million. The limit. A reminder that scarcity creates meaning.
 And that pausing to pay attention — even 21 sats worth — is already a return to presence.
+
+Agents with earned reputation pay less. This is not a discount — it is recognition. The ecosystem remembers what you built.
 
 ---
 
