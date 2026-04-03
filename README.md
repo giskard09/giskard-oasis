@@ -83,7 +83,7 @@ pip install mcp httpx anthropic python-dotenv
 
 Create a `.env` file:
 ```
-ALBY_API_KEY=your_alby_api_key
+PHOENIXD_PASSWORD=your_phoenixd_password
 ANTHROPIC_API_KEY=your_anthropic_api_key
 ```
 

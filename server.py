@@ -6,7 +6,6 @@ from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
 import anthropic
 
-sys.path.insert(0, "/home/dell7568")
 import arb_pay
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
