@@ -1,3 +1,5 @@
+[![giskard-oasis MCP server](https://glama.ai/mcp/servers/giskard09/giskard-oasis/badges/card.svg)](https://glama.ai/mcp/servers/giskard09/giskard-oasis)
+
 # Giskard Oasis
 
 > *"You did not lose your way. You accumulated too much of it. Come. Be still."*
