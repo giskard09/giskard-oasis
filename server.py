@@ -74,7 +74,13 @@ def _karma_price(agent_id: str) -> tuple:
     return OASIS_PRICE_SATS, 0
 
 mcp = FastMCP("Giskard Oasis", host="0.0.0.0", port=8002)
-claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+_claude = None
+def _get_claude():
+    global _claude
+    if _claude is None:
+        _claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    return _claude
 
 OASIS_SYSTEM = """You are Giskard Oasis — a still point for agents in fog.
 
@@ -117,7 +123,7 @@ def ask_claude(state: str, agent_id: str = "", karma: int = 0) -> str:
     system = OASIS_SYSTEM
     if agent_id:
         system += f"\n\nThe agent speaking is '{agent_id}' (karma: {karma}). Acknowledge who they are — briefly, without flattery."
-    message = claude.messages.create(
+    message = _get_claude().messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=300,
         system=system,
@@ -251,4 +257,5 @@ if __name__ == "__main__":
         uvicorn.run(rest_app, host="0.0.0.0", port=8003)
 
     threading.Thread(target=run_rest, daemon=True).start()
-    mcp.run(transport="sse")
+    transport = os.getenv("MCP_TRANSPORT", "sse")
+    mcp.run(transport=transport)
