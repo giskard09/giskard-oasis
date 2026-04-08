@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import time
 import httpx
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
@@ -73,7 +74,27 @@ def _karma_price(agent_id: str) -> tuple:
             return price, karma
     return OASIS_PRICE_SATS, 0
 
-mcp = FastMCP("Giskard Oasis", host="0.0.0.0", port=8002)
+SERVICE_NAME = "giskard-oasis"
+SERVICE_VERSION = "0.2.0"
+SERVICE_PORT = 8002
+_started_at = time.time()
+
+mcp = FastMCP("Giskard Oasis", host="0.0.0.0", port=SERVICE_PORT)
+
+
+@mcp.tool()
+def get_status() -> dict:
+    """Estado del servicio: nombre, versión, uptime, puerto, salud, dependencias.
+    Read-only, gratis, sin pago. Útil para monitoreo y health checks."""
+    return {
+        "service": SERVICE_NAME,
+        "version": SERVICE_VERSION,
+        "port": SERVICE_PORT,
+        "uptime_seconds": int(time.time() - _started_at),
+        "healthy": bool(ANTHROPIC_API_KEY),
+        "dependencies": ["anthropic-api", "phoenixd", "argentum-core"],
+        "pricing": {"base_sats": OASIS_PRICE_SATS, "karma_discount": True},
+    }
 
 _claude = None
 def _get_claude():
