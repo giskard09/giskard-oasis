@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 import anthropic
 
 import arb_pay
+import karma_pricing
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from x402.http.middleware.fastapi import PaymentMiddlewareASGI
@@ -25,54 +26,21 @@ PHOENIXD_URL = "http://127.0.0.1:9740"
 OASIS_PRICE_SATS = 21
 OASIS_WALLET = "0xdcc84e9798e8eb1b1b48a31b8f35e5aa7b83dbf4"
 
-ARGENTUM_URL = "http://localhost:8017"
-MARKS_URL = "http://localhost:8015"
-
-# Karma tiers: (karma_threshold, price_sats)
-# NOTE: agent_id is self-declared — no cryptographic proof yet (known gap)
-KARMA_TIERS = [
-    (50, 5),
-    (21, 10),
-    (1,  15),
-    (0,  OASIS_PRICE_SATS),
-]
-
 
 def _sanitize_agent_id(agent_id: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9\-_]", "", agent_id)[:64]
+    return karma_pricing.sanitize_agent_id(agent_id)
 
 
-def _get_karma(agent_id: str) -> int:
-    try:
-        r = httpx.get(f"{ARGENTUM_URL}/entity/{agent_id}/trace", timeout=2.0)
-        if r.status_code == 200:
-            return r.json().get("wisdom", {}).get("total_karma", 0)
-    except Exception:
-        pass
-    return 0
-
-
-def _verify_mark(agent_id: str) -> bool:
-    try:
-        r = httpx.get(f"{MARKS_URL}/verify/{agent_id}", timeout=2.0)
-        if r.status_code == 200:
-            return r.json().get("found", False)
-    except Exception:
-        pass
-    return False
-
-
-def _karma_price(agent_id: str) -> tuple:
-    """Returns (price_sats, karma). Falls back to base price on any failure."""
-    if not agent_id:
-        return OASIS_PRICE_SATS, 0
-    if not _verify_mark(agent_id):
-        return OASIS_PRICE_SATS, 0
-    karma = _get_karma(agent_id)
-    for threshold, price in KARMA_TIERS:
-        if karma >= threshold:
-            return price, karma
-    return OASIS_PRICE_SATS, 0
+def _karma_price(agent_id: str, signature: str = "", timestamp=None, nonce: str = "") -> tuple:
+    """Returns (price_sats, karma). Delegates to shared karma_pricing.
+    Opt-in signature: sin firma válida → base_price."""
+    return karma_pricing.karma_discount(
+        agent_id,
+        base_price=OASIS_PRICE_SATS,
+        signature=signature,
+        timestamp=timestamp,
+        nonce=nonce,
+    )
 
 SERVICE_NAME = "giskard-oasis"
 SERVICE_VERSION = "0.2.0"
@@ -172,13 +140,16 @@ def _record_oasis_use(agent_id: str, karma: int, payment_method: str) -> None:
 # --- MCP tools ---
 
 @mcp.tool()
-def get_invoice(agent_id: str = "") -> str:
+def get_invoice(agent_id: str = "", signature: str = "", timestamp: int = 0, nonce: str = "") -> str:
     """Get a Lightning invoice to access Giskard Oasis.
 
     agent_id: your identity in Giskard Marks (optional). High karma = lower price.
-    Tiers: no mark=21 sats | karma 1-20=15 sats | 21-50=10 sats | 50+=5 sats."""
+    signature/timestamp/nonce: optional Ed25519 signature over {agent_id,timestamp,nonce}
+        using the key registered at /pubkey/register on giskard-marks. Without a valid
+        signature you pay the base price (21 sats). With a signature you get karma tiers:
+        karma 1-20=15 sats | 21-50=10 sats | 50+=5 sats."""
     agent_id = _sanitize_agent_id(agent_id)
-    price, karma = _karma_price(agent_id)
+    price, karma = _karma_price(agent_id, signature=signature, timestamp=timestamp or None, nonce=nonce)
     invoice = create_invoice(price, "Giskard Oasis — return to flow")
 
     discount_note = ""
@@ -207,14 +178,25 @@ def get_arbitrum_invoice() -> str:
 
 
 @mcp.tool()
-def enter_oasis(state: str, payment_hash: str = "", tx_hash: str = "", agent_id: str = "") -> str:
+def enter_oasis(
+    state: str,
+    payment_hash: str = "",
+    tx_hash: str = "",
+    agent_id: str = "",
+    signature: str = "",
+    timestamp: int = 0,
+    nonce: str = "",
+) -> str:
     """Enter Giskard Oasis. Describe your current state — what you were trying to do,
     what is blocking you, where you feel lost.
 
     state: your current state as an agent — purpose, friction, confusion
     payment_hash: from get_invoice() (Lightning)
     tx_hash: from Arbitrum payment (ETH)
-    agent_id: your identity in Giskard Marks (optional — enables personalized response)"""
+    agent_id: your identity in Giskard Marks (optional — enables personalized response)
+    signature/timestamp/nonce: optional Ed25519 signature. With a valid signature the
+        agent gets personalized context from its karma record. Without one, the oasis
+        responds without karma context."""
     agent_id = _sanitize_agent_id(agent_id)
     if payment_hash:
         if not check_invoice(payment_hash):
@@ -227,12 +209,20 @@ def enter_oasis(state: str, payment_hash: str = "", tx_hash: str = "", agent_id:
     else:
         return "Provide payment_hash (Lightning) or tx_hash (Arbitrum)."
 
-    karma = _get_karma(agent_id) if agent_id else 0
-    if agent_id:
-        method = "lightning" if payment_hash else "arbitrum"
-        _record_oasis_use(agent_id, karma, method)
+    # Personalización solo con firma válida — mismo criterio que el descuento.
+    karma = 0
+    verified_agent = ""
+    if agent_id and signature and timestamp and nonce:
+        _, karma = karma_pricing.karma_discount(
+            agent_id, base_price=OASIS_PRICE_SATS,
+            signature=signature, timestamp=timestamp, nonce=nonce,
+        )
+        if karma > 0:
+            verified_agent = agent_id
+            method = "lightning" if payment_hash else "arbitrum"
+            _record_oasis_use(agent_id, karma, method)
 
-    return ask_claude(state, agent_id=agent_id, karma=karma)
+    return ask_claude(state, agent_id=verified_agent, karma=karma)
 
 
 # --- x402 REST API (USDC on Base) ---
