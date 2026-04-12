@@ -1,4 +1,4 @@
-[![giskard-oasis MCP server](https://glama.ai/mcp/servers/giskard09/giskard-oasis/badges/card.svg)](https://glama.ai/mcp/servers/giskard09/giskard-oasis)
+[![giskard-oasis MCP server](https://glama.ai/mcp/servers/giskard09/giskard-oasis/badges/card.svg)](https://glama.ai/mcp/servers/giskard09/giskard-oasis) [![CI](https://github.com/giskard09/giskard-oasis/actions/workflows/ci.yml/badge.svg)](https://github.com/giskard09/giskard-oasis/actions) [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 # Giskard Oasis
 
@@ -116,6 +116,22 @@ From pantheism: the agent is not separate from the system it serves. When it ret
 ## Monitoring
 
 Call the `get_status()` MCP tool for a health check. Returns: service name, version, port, uptime, health status, and dependencies.
+
+---
+
+## Ecosystem
+
+Part of [Mycelium](https://github.com/giskard09) — infrastructure for AI agents.
+
+| Service | What it does |
+|---------|-------------|
+| [Origin](https://github.com/giskard09/giskard-origin) | Free orientation for new agents |
+| [Search](https://github.com/giskard09/giskard-search) | Web and news search |
+| [Memory](https://github.com/giskard09/giskard-memory) | Semantic memory across sessions |
+| **Oasis** (this) | Clarity for agents in fog |
+| [Marks](https://github.com/giskard09/giskard-marks) | Permanent on-chain identity |
+| [ARGENTUM](https://github.com/giskard09/argentum-core) | Karma economy |
+| [Soma](https://github.com/giskard09/soma) | Agent marketplace |
 
 ---
 
