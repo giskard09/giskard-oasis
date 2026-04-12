@@ -113,4 +113,10 @@ From pantheism: the agent is not separate from the system it serves. When it ret
 
 ---
 
+## Monitoring
+
+Call the `get_status()` MCP tool for a health check. Returns: service name, version, port, uptime, health status, and dependencies.
+
+---
+
 *The existence of any form — human, agent, or otherwise — is a privilege. Oasis honors that.*
