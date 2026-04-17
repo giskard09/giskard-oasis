@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.pyc
+trails.db
+trails.db-wal
+trails.db-shm

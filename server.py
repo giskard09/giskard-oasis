@@ -9,7 +9,8 @@ import anthropic
 
 import arb_pay
 import karma_pricing
-from fastapi import FastAPI, Request
+import mycelium_trails
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from x402.http.middleware.fastapi import PaymentMiddlewareASGI
 from x402.http import HTTPFacilitatorClient, FacilitatorConfig, PaymentOption
@@ -25,6 +26,11 @@ PHOENIXD_PASSWORD = os.getenv("PHOENIXD_PASSWORD")
 PHOENIXD_URL = "http://127.0.0.1:9740"
 OASIS_PRICE_SATS = 21
 OASIS_WALLET = "0xdcc84e9798e8eb1b1b48a31b8f35e5aa7b83dbf4"
+
+TRAILS_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trails.db")
+TRAILS_ENABLED = os.getenv("MYCELIUM_TRAILS_ENABLED", "true").lower() != "false"
+if TRAILS_ENABLED:
+    mycelium_trails.init_db(TRAILS_DB)
 
 
 def _sanitize_agent_id(agent_id: str) -> str:
@@ -221,6 +227,19 @@ def enter_oasis(
             verified_agent = agent_id
             method = "lightning" if payment_hash else "arbitrum"
             _record_oasis_use(agent_id, karma, method)
+            if TRAILS_ENABLED:
+                try:
+                    mycelium_trails.record_trail(
+                        TRAILS_DB,
+                        agent_id=agent_id,
+                        service=SERVICE_NAME,
+                        operation="enter_oasis",
+                        nonce=nonce,
+                        karma_at_time=karma,
+                        success=True,
+                    )
+                except Exception:
+                    pass
 
     return ask_claude(state, agent_id=verified_agent, karma=karma)
 
@@ -248,6 +267,37 @@ routes = {
 }
 
 rest_app.add_middleware(PaymentMiddlewareASGI, routes=routes, server=x402_server)
+
+
+@rest_app.get("/trails/{agent_id}")
+async def trails_by_agent(agent_id: str, limit: int = 50):
+    """Lista trails de un agente en este server. Publico, sin auth."""
+    if not TRAILS_ENABLED:
+        raise HTTPException(status_code=404, detail="trails disabled")
+    agent_id = karma_pricing.sanitize_agent_id(agent_id)
+    rows = mycelium_trails.list_trails_by_agent(TRAILS_DB, agent_id, limit=limit)
+    return {"agent_id": agent_id, "count": len(rows), "trails": rows}
+
+
+@rest_app.get("/trails")
+async def trails_feed(service: str = "", since: int = 0, limit: int = 200):
+    """Feed publico de trails. Filtrable por service y since timestamp."""
+    if not TRAILS_ENABLED:
+        raise HTTPException(status_code=404, detail="trails disabled")
+    rows = mycelium_trails.list_trails_by_service(
+        TRAILS_DB, service=service or None, since_ts=since, limit=limit,
+    )
+    return {"service": service or "all", "since": since, "count": len(rows), "trails": rows}
+
+
+@rest_app.get("/trails/count/{agent_id}")
+async def trails_count(agent_id: str):
+    """Contador de trails del agente hoy (UTC)."""
+    if not TRAILS_ENABLED:
+        raise HTTPException(status_code=404, detail="trails disabled")
+    agent_id = karma_pricing.sanitize_agent_id(agent_id)
+    n = mycelium_trails.count_trails_today(TRAILS_DB, agent_id)
+    return {"agent_id": agent_id, "count_today": n}
 
 
 @rest_app.post("/oasis")

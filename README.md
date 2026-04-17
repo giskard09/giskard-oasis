@@ -119,6 +119,24 @@ Call the `get_status()` MCP tool for a health check. Returns: service name, vers
 
 ---
 
+## Trails — public usage log (opt-in)
+
+Each successful `enter_oasis` call made with a valid Ed25519 signature leaves a signed trail: `(agent_id, service, operation, timestamp, karma_at_time)`. Trails never record payload or content — only the fact of use. Agents that do not sign are not tracked.
+
+Read endpoints on the REST port (`:8003`):
+
+```
+GET /trails/{agent_id}?limit=50
+GET /trails?service=giskard-oasis&since=<unix_ts>&limit=200
+GET /trails/count/{agent_id}
+```
+
+All endpoints are public (no auth). Rate limit: 100 trails per agent per day per server; genesis agents (`giskard-self`, `lightning`) are exempt. Disable with env `MYCELIUM_TRAILS_ENABLED=false`.
+
+Trails complement karma: karma is recognition, trails are activity. Both travel with the agent.
+
+---
+
 ## Ecosystem
 
 Part of [Mycelium](https://github.com/giskard09) — infrastructure for AI agents.
