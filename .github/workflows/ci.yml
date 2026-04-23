@@ -5,6 +5,7 @@ on:
     branches: [main, master]
   pull_request:
     branches: [main, master]
+  workflow_dispatch:
 
 jobs:
   audit:
@@ -59,6 +60,9 @@ jobs:
       - name: Run tests if present
         run: |
           if [ -d tests ] || ls test_*.py 2>/dev/null | grep -q .; then
+            if [ -f requirements.txt ]; then
+              pip install -r requirements.txt
+            fi
             pip install pytest
             pytest -q || exit 1
           else
