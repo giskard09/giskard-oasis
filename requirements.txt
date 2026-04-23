@@ -1,0 +1,10 @@
+anthropic
+fastapi
+httpx
+mcp
+pynacl
+pytest
+python-dotenv
+uvicorn
+web3
+x402
