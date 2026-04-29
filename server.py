@@ -269,6 +269,19 @@ routes = {
 rest_app.add_middleware(PaymentMiddlewareASGI, routes=routes, server=x402_server)
 
 
+@rest_app.get("/status")
+async def status_rest():
+    from fastapi.responses import JSONResponse as _JSONResponse
+    return _JSONResponse({
+        "service": SERVICE_NAME,
+        "version": SERVICE_VERSION,
+        "port": 8003,
+        "uptime_seconds": int(time.time() - _started_at),
+        "healthy": bool(ANTHROPIC_API_KEY and PHOENIXD_PASSWORD),
+        "dependencies": ["anthropic-api", "phoenixd", "arbitrum-rpc"],
+    })
+
+
 @rest_app.get("/trails/{agent_id}")
 async def trails_by_agent(agent_id: str, limit: int = 50):
     """Lista trails de un agente en este server. Publico, sin auth."""
