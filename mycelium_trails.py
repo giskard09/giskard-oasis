@@ -34,12 +34,23 @@ _DDL = [
         karma_at_time  INTEGER,
         success        INTEGER DEFAULT 1,
         signature_ref  TEXT NOT NULL,
+        metadata       TEXT,
         created_at     INTEGER DEFAULT (strftime('%s','now'))
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_trails_agent ON trails(agent_id, timestamp DESC)",
     "CREATE INDEX IF NOT EXISTS idx_trails_service_time ON trails(service, timestamp DESC)",
+    # migration: add metadata column if upgrading from pre-v2 schema
+    "ALTER TABLE trails ADD COLUMN metadata TEXT",
 ]
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """Aplica migraciones idempotentes post-DDL."""
+    try:
+        conn.execute("ALTER TABLE trails ADD COLUMN metadata TEXT")
+    except Exception:
+        pass  # column ya existe
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -54,8 +65,9 @@ def init_db(db_path: str) -> None:
     """Idempotente — crea tabla e indices si no existen."""
     conn = _connect(db_path)
     try:
-        for stmt in _DDL:
+        for stmt in _DDL[:-1]:  # skip the ALTER (handled in _apply_migrations)
             conn.execute(stmt)
+        _apply_migrations(conn)
     finally:
         conn.close()
 
@@ -97,6 +109,7 @@ def record_trail(
     rate_limit_cap: int = RATE_LIMIT_DEFAULT,
     genesis_agents: Iterable[str] = GENESIS_AGENTS_DEFAULT,
     now: Optional[int] = None,
+    metadata: Optional[dict] = None,
 ) -> Optional[str]:
     """Graba un trail. Retorna trail_id o None si cae por rate limit o input invalido.
 
@@ -111,16 +124,18 @@ def record_trail(
         if used >= rate_limit_cap:
             return None
 
+    import json as _json
     trail_id = str(uuid.uuid4())
     ts = int(now if now is not None else time.time())
+    metadata_str = _json.dumps(metadata) if metadata else None
     conn = _connect(db_path)
     try:
         conn.execute(
             """
             INSERT INTO trails
               (trail_id, agent_id, service, operation, timestamp,
-               karma_at_time, success, signature_ref)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               karma_at_time, success, signature_ref, metadata)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trail_id,
@@ -131,6 +146,7 @@ def record_trail(
                 karma_at_time,
                 1 if success else 0,
                 _sig_ref(nonce),
+                metadata_str,
             ),
         )
         return trail_id
@@ -139,6 +155,11 @@ def record_trail(
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict:
+    import json as _json
+    try:
+        meta_raw = row["metadata"]
+    except (IndexError, KeyError):
+        meta_raw = None
     return {
         "trail_id": row["trail_id"],
         "agent_id": row["agent_id"],
@@ -148,6 +169,7 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
         "karma_at_time": row["karma_at_time"],
         "success": bool(row["success"]),
         "signature_ref": row["signature_ref"],
+        "metadata": _json.loads(meta_raw) if meta_raw else None,
     }
 
 
@@ -162,7 +184,7 @@ def list_trails_by_agent(
         rows = conn.execute(
             """
             SELECT trail_id, agent_id, service, operation, timestamp,
-                   karma_at_time, success, signature_ref
+                   karma_at_time, success, signature_ref, metadata
             FROM trails
             WHERE agent_id=?
             ORDER BY timestamp DESC
@@ -188,7 +210,7 @@ def list_trails_by_service(
             rows = conn.execute(
                 """
                 SELECT trail_id, agent_id, service, operation, timestamp,
-                       karma_at_time, success, signature_ref
+                       karma_at_time, success, signature_ref, metadata
                 FROM trails
                 WHERE service=? AND timestamp>=?
                 ORDER BY timestamp DESC
@@ -200,7 +222,7 @@ def list_trails_by_service(
             rows = conn.execute(
                 """
                 SELECT trail_id, agent_id, service, operation, timestamp,
-                       karma_at_time, success, signature_ref
+                       karma_at_time, success, signature_ref, metadata
                 FROM trails
                 WHERE timestamp>=?
                 ORDER BY timestamp DESC

@@ -10,6 +10,7 @@ import anthropic
 import arb_pay
 import karma_pricing
 import mycelium_trails
+import deframe_bridge
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from x402.http.middleware.fastapi import PaymentMiddlewareASGI
@@ -157,6 +158,49 @@ def _record_oasis_use(agent_id: str, karma: int, payment_method: str) -> None:
         pass
 
 
+def _try_bridge_demo(amount_sats: int) -> dict:
+    """Intenta el swap demo USDC→WETH en Arbitrum via bridge provider.
+    Retorna metadata dict para el trail. No lanza excepciones.
+    Si no hay API key o el swap falla, retorna metadata con bridge_status='bridge_failed'.
+    """
+    try:
+        # 1 sat ≈ $0.001 aprox (BTC ~$100k). Usar valor fijo conservador para el demo.
+        # En producción esto vendría del phoenixd payment settled amount.
+        SATS_PER_USD = 1000
+        amount_wei = deframe_bridge.sats_to_usdc_wei(amount_sats, SATS_PER_USD)
+        # Usar mínimo 1 USDC (1_000_000 wei) para garantizar ruta disponible
+        amount_wei = str(max(int(amount_wei), 1_000_000))
+        quote = deframe_bridge.get_swap_quote(
+            from_token=deframe_bridge.DEFAULT_TOKEN_IN,
+            to_token=deframe_bridge.DEFAULT_TOKEN_OUT,
+            amount_wei=amount_wei,
+            origin_chain=deframe_bridge.DEFAULT_CHAIN,
+            destination_chain=deframe_bridge.DEFAULT_CHAIN,
+        )
+        if "error" in quote or quote.get("status") == "bridge_failed":
+            return deframe_bridge.build_demo_metadata(
+                amount_sats=amount_sats,
+                quote=quote,
+                bridge_status="bridge_failed",
+            )
+        # Si hay quote, intentar bytecode (solo para demo — no se broadcastea aquí)
+        # El broadcast requiere wallet signing; se delega a giskard-signer en v2.
+        # Por ahora registramos el quote_id como evidencia del flujo.
+        return deframe_bridge.build_demo_metadata(
+            amount_sats=amount_sats,
+            quote=quote,
+            bridge_tx_hash=None,  # se llena cuando se broadcastea
+            bridge_status="quoted",
+        )
+    except Exception as e:
+        return {
+            "amount_sats": amount_sats,
+            "bridge_status": "bridge_failed",
+            "bridge_error": str(e),
+            "bridge_tx_hash": None,
+        }
+
+
 # --- MCP tools ---
 
 @mcp.tool()
@@ -243,6 +287,10 @@ def enter_oasis(
             _record_oasis_use(agent_id, karma, method)
             if TRAILS_ENABLED:
                 try:
+                    # bridge demo: convertir sats pagados a USDC→token Arbitrum
+                    bridge_meta = None
+                    if payment_hash:
+                        bridge_meta = _try_bridge_demo(karma)
                     mycelium_trails.record_trail(
                         TRAILS_DB,
                         agent_id=agent_id,
@@ -251,6 +299,7 @@ def enter_oasis(
                         nonce=nonce,
                         karma_at_time=karma,
                         success=True,
+                        metadata=bridge_meta,
                     )
                 except Exception:
                     pass
@@ -294,6 +343,52 @@ async def status_rest():
         "healthy": bool(ANTHROPIC_API_KEY and PHOENIXD_PASSWORD),
         "dependencies": ["anthropic-api", "phoenixd", "arbitrum-rpc"],
     })
+
+
+@rest_app.get("/trails/demo")
+async def trails_demo(limit: int = 10):
+    """Trails del flujo demo — pago Lightning + bridge on-chain + trail registrado.
+    Solo retorna trails con metadata (campo bridge_tx_hash presente).
+    Público, sin auth. Límite máximo 50."""
+    if not TRAILS_ENABLED:
+        raise HTTPException(status_code=404, detail="trails disabled")
+    limit = max(1, min(int(limit), 50))
+    import sqlite3 as _sqlite3
+    conn = _sqlite3.connect(TRAILS_DB)
+    conn.row_factory = _sqlite3.Row
+    try:
+        rows = conn.execute(
+            """
+            SELECT trail_id, agent_id, service, operation, timestamp,
+                   karma_at_time, success, signature_ref, metadata
+            FROM trails
+            WHERE metadata IS NOT NULL
+              AND metadata LIKE '%bridge_tx_hash%'
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    import json as _json
+    results = []
+    for r in rows:
+        meta = _json.loads(r["metadata"]) if r["metadata"] else {}
+        results.append({
+            "trail_id": r["trail_id"],
+            "caller_id": r["agent_id"],
+            "service": r["service"],
+            "timestamp": r["timestamp"],
+            "amount_sats": meta.get("amount_sats"),
+            "amount_usd_equiv": meta.get("amount_usd_equiv"),
+            "bridge_tx_hash": meta.get("bridge_tx_hash"),
+            "bridge_status": meta.get("bridge_status"),
+            "to_amount": meta.get("to_amount"),
+            "to_token": meta.get("to_token"),
+        })
+    return {"count": len(results), "trails": results}
 
 
 @rest_app.get("/trails/{agent_id}")
