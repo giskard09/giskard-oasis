@@ -84,7 +84,7 @@ def get_swap_bytecode(quote_id: str, sender: str, recipient: str) -> dict:
     """Llama /v2/swap/bytecode con un quote activo."""
     if not BRIDGE_API_KEY:
         return {"error": "no_api_key", "status": "bridge_failed"}
-    payload = {"quoteId": quote_id, "sender": sender, "recipient": recipient}
+    payload = {"quoteId": quote_id, "originAddress": sender, "destinationAddress": recipient}
     try:
         r = httpx.post(
             f"{BRIDGE_API_BASE}/v2/swap/bytecode",

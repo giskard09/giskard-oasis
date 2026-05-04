@@ -11,6 +11,9 @@ import arb_pay
 import karma_pricing
 import mycelium_trails
 import deframe_bridge
+import sys as _sys
+_sys.path.insert(0, "/home/dell7568/giskard-signer")
+from signer.client import SignerClient as _SignerClient
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from x402.http.middleware.fastapi import PaymentMiddlewareASGI
@@ -159,23 +162,24 @@ def _record_oasis_use(agent_id: str, karma: int, payment_method: str) -> None:
 
 
 def _try_bridge_demo(amount_sats: int) -> dict:
-    """Intenta el swap demo USDC→WETH en Arbitrum via bridge provider.
+    """Ejecuta el swap demo USDC→WETH en Base via bridge provider + giskard-signer.
     Retorna metadata dict para el trail. No lanza excepciones.
-    Si no hay API key o el swap falla, retorna metadata con bridge_status='bridge_failed'.
+    Si cualquier paso falla, retorna bridge_status='bridge_failed'.
     """
     try:
-        # 1 sat ≈ $0.001 aprox (BTC ~$100k). Usar valor fijo conservador para el demo.
-        # En producción esto vendría del phoenixd payment settled amount.
         SATS_PER_USD = 1000
         amount_wei = deframe_bridge.sats_to_usdc_wei(amount_sats, SATS_PER_USD)
-        # Usar mínimo 1 USDC (1_000_000 wei) para garantizar ruta disponible
         amount_wei = str(max(int(amount_wei), 1_000_000))
+
+        owner_addr = "0xDcc84E9798E8eB1b1b48A31B8f35e5AA7b83DBF4"
+
         quote = deframe_bridge.get_swap_quote(
             from_token=deframe_bridge.DEFAULT_TOKEN_IN,
             to_token=deframe_bridge.DEFAULT_TOKEN_OUT,
             amount_wei=amount_wei,
             origin_chain=deframe_bridge.DEFAULT_CHAIN,
             destination_chain=deframe_bridge.DEFAULT_CHAIN,
+            sender=owner_addr,
         )
         if "error" in quote or quote.get("status") == "bridge_failed":
             return deframe_bridge.build_demo_metadata(
@@ -183,14 +187,55 @@ def _try_bridge_demo(amount_sats: int) -> dict:
                 quote=quote,
                 bridge_status="bridge_failed",
             )
-        # Si hay quote, intentar bytecode (solo para demo — no se broadcastea aquí)
-        # El broadcast requiere wallet signing; se delega a giskard-signer en v2.
-        # Por ahora registramos el quote_id como evidencia del flujo.
+
+        quote_id = quote.get("quoteId") or quote.get("id")
+        if not quote_id:
+            return deframe_bridge.build_demo_metadata(
+                amount_sats=amount_sats,
+                quote=quote,
+                bridge_status="bridge_failed",
+            )
+
+        bytecode_resp = deframe_bridge.get_swap_bytecode(
+            quote_id=quote_id,
+            sender=owner_addr,
+            recipient=owner_addr,
+        )
+        if "error" in bytecode_resp or bytecode_resp.get("status") == "bridge_failed":
+            return deframe_bridge.build_demo_metadata(
+                amount_sats=amount_sats,
+                quote=quote,
+                bridge_status="bridge_failed",
+            )
+
+        # bytecode_resp.transactionData es un array ordenado de txs (approve, swap, callback)
+        tx_list = bytecode_resp.get("transactionData", [])
+        if not tx_list:
+            return deframe_bridge.build_demo_metadata(
+                amount_sats=amount_sats,
+                quote=quote,
+                bridge_status="bridge_failed",
+            )
+
+        chain_id = int(deframe_bridge.DEFAULT_CHAIN)
+        signer = _SignerClient()
+        last_hash = None
+        for step in tx_list:
+            tx = {
+                "to": step["to"],
+                "data": step.get("data", "0x"),
+                "value": int(step.get("value", 0)),
+                "chainId": chain_id,
+            }
+            last_hash = signer.send_transaction("owner", tx, chain_id=chain_id)
+
+        tx_hash = last_hash
+
         return deframe_bridge.build_demo_metadata(
             amount_sats=amount_sats,
             quote=quote,
-            bridge_tx_hash=None,  # se llena cuando se broadcastea
-            bridge_status="quoted",
+            bridge_tx_hash=tx_hash,
+            bridge_status="broadcast",
         )
     except Exception as e:
         return {
