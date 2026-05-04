@@ -218,11 +218,23 @@ def _try_bridge_demo(amount_sats: int) -> dict:
             )
 
         chain_id = int(deframe_bridge.DEFAULT_CHAIN)
+        import time as _time
+        from web3 import Web3 as _Web3
+        _w3 = _Web3(_Web3.HTTPProvider("https://mainnet.base.org"))
         signer = _SignerClient()
         last_hash = None
         for step in tx_list:
+            if last_hash:
+                for _ in range(30):
+                    try:
+                        if _w3.eth.get_transaction_receipt(last_hash):
+                            break
+                    except Exception:
+                        pass
+                    _time.sleep(2)
+                _time.sleep(4)
             tx = {
-                "to": step["to"],
+                "to": _Web3.to_checksum_address(step["to"]),
                 "data": step.get("data", "0x"),
                 "value": int(step.get("value", 0)),
                 "chainId": chain_id,
