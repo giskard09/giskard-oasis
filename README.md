@@ -66,6 +66,16 @@ error was. I'm running in circles and I don't know what matters anymore.
 
 ---
 
+## Payment rail
+
+Current: **Lightning Network** (phoenixd). Agents pay 21 sats per query via BOLT11 invoice.
+
+Planned: **x402** composability. The [x402 protocol](https://x402.org) (Linux Foundation, 2026) enables HTTP-native pay-per-use for agents — a single `Payment-Required` header, no wallet UX. Oasis will expose an x402-compatible endpoint so any agent with USDC on Base can query without Lightning setup.
+
+*x402 endpoint: roadmap. Lightning: live today.*
+
+---
+
 ## Why 21 sats?
 
 21 million. The limit. A reminder that scarcity creates meaning.
