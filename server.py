@@ -185,7 +185,12 @@ def _try_bridge_demo(amount_sats: int) -> dict:
     """Ejecuta el swap demo USDC→WETH en Base via bridge provider + giskard-signer.
     Retorna metadata dict para el trail. No lanza excepciones.
     Si cualquier paso falla, retorna bridge_status='bridge_failed'.
+    Reintenta con quote fresca si el broadcast falla por slippage (ContractCustomError).
     """
+    return _try_bridge_demo_attempt(amount_sats, retry=True)
+
+
+def _try_bridge_demo_attempt(amount_sats: int, retry: bool = False) -> dict:
     try:
         SATS_PER_USD = 1000
         amount_wei = deframe_bridge.sats_to_usdc_wei(amount_sats, SATS_PER_USD)
@@ -262,10 +267,16 @@ def _try_bridge_demo(amount_sats: int) -> dict:
             bridge_status="broadcast",
         )
     except Exception as e:
+        err_str = str(e)
+        # ContractCustomError indica slippage — precio se movió entre quote y broadcast.
+        # Reintentar una vez con quote fresca (precio actualizado).
+        if retry and "ContractCustomError" in err_str:
+            logger.warning("bridge slippage error, retrying with fresh quote: %s", err_str)
+            return _try_bridge_demo_attempt(amount_sats, retry=False)
         return {
             "amount_sats": amount_sats,
             "bridge_status": "bridge_failed",
-            "bridge_error": str(e),
+            "bridge_error": err_str,
             "bridge_tx_hash": None,
         }
 
