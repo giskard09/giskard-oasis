@@ -17,6 +17,7 @@ import hashlib
 import sqlite3
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 GENESIS_AGENTS_DEFAULT = frozenset({"giskard-self", "lightning"})
@@ -35,22 +36,37 @@ _DDL = [
         success        INTEGER DEFAULT 1,
         signature_ref  TEXT NOT NULL,
         metadata       TEXT,
+        action_ref     TEXT,
         created_at     INTEGER DEFAULT (strftime('%s','now'))
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_trails_agent ON trails(agent_id, timestamp DESC)",
     "CREATE INDEX IF NOT EXISTS idx_trails_service_time ON trails(service, timestamp DESC)",
-    # migration: add metadata column if upgrading from pre-v2 schema
-    "ALTER TABLE trails ADD COLUMN metadata TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_trails_action_ref ON trails(action_ref)",
 ]
+
+
+def compute_action_ref(agent_id: str, action_type: str, scope: str, timestamp: int) -> str:
+    """SHA-256 canónico que identifica un trail de forma única y determinística.
+
+    Misma función que argentum-sdk/argentum/trails.py — mantener en sync.
+    Callers externos pueden pre-generar el mismo hash antes de que el trail exista.
+    """
+    payload = f"{agent_id}:{action_type}:{scope}:{int(timestamp)}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Aplica migraciones idempotentes post-DDL."""
+    for col, col_type in [("metadata", "TEXT"), ("action_ref", "TEXT")]:
+        try:
+            conn.execute(f"ALTER TABLE trails ADD COLUMN {col} {col_type}")
+        except Exception:
+            pass
     try:
-        conn.execute("ALTER TABLE trails ADD COLUMN metadata TEXT")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trails_action_ref ON trails(action_ref)")
     except Exception:
-        pass  # column ya existe
+        pass
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -114,6 +130,7 @@ def record_trail(
     """Graba un trail. Retorna trail_id o None si cae por rate limit o input invalido.
 
     Precondicion: la firma Ed25519 ya fue verificada por el caller.
+    action_ref se computa automáticamente de (agent_id, operation, service, timestamp).
     """
     if not (agent_id and service and operation and nonce):
         return None
@@ -128,14 +145,15 @@ def record_trail(
     trail_id = str(uuid.uuid4())
     ts = int(now if now is not None else time.time())
     metadata_str = _json.dumps(metadata) if metadata else None
+    action_ref = compute_action_ref(agent_id, operation, service, ts)
     conn = _connect(db_path)
     try:
         conn.execute(
             """
             INSERT INTO trails
               (trail_id, agent_id, service, operation, timestamp,
-               karma_at_time, success, signature_ref, metadata)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               karma_at_time, success, signature_ref, metadata, action_ref)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trail_id,
@@ -147,6 +165,7 @@ def record_trail(
                 1 if success else 0,
                 _sig_ref(nonce),
                 metadata_str,
+                action_ref,
             ),
         )
         return trail_id
@@ -160,6 +179,10 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
         meta_raw = row["metadata"]
     except (IndexError, KeyError):
         meta_raw = None
+    try:
+        action_ref = row["action_ref"]
+    except (IndexError, KeyError):
+        action_ref = None
     return {
         "trail_id": row["trail_id"],
         "agent_id": row["agent_id"],
@@ -169,8 +192,33 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
         "karma_at_time": row["karma_at_time"],
         "success": bool(row["success"]),
         "signature_ref": row["signature_ref"],
+        "action_ref": action_ref,
         "metadata": _json.loads(meta_raw) if meta_raw else None,
     }
+
+
+def find_by_action_ref(
+    db_path: str,
+    agent_id: str,
+    action_ref: str,
+) -> Optional[dict]:
+    """Lookup exacto por agent_id + action_ref. Retorna el trail o None."""
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT trail_id, agent_id, service, operation, timestamp,
+                   karma_at_time, success, signature_ref, metadata, action_ref
+            FROM trails
+            WHERE agent_id=? AND action_ref=?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (agent_id, action_ref),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+    finally:
+        conn.close()
 
 
 def list_trails_by_agent(

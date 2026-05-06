@@ -3,9 +3,12 @@ import re
 import sys
 import time
 import httpx
+from typing import Optional
 from mcp.server.fastmcp import FastMCP
 from dotenv import load_dotenv
 import anthropic
+
+load_dotenv()  # antes de imports del proyecto para que os.getenv sea correcto
 
 import arb_pay
 import karma_pricing
@@ -22,8 +25,6 @@ from x402.http.types import RouteConfig
 from x402.server import x402ResourceServer
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
 import uvicorn
-
-load_dotenv()
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 PHOENIXD_PASSWORD = os.getenv("PHOENIXD_PASSWORD")
@@ -161,6 +162,25 @@ def _record_oasis_use(agent_id: str, karma: int, payment_method: str) -> None:
         pass
 
 
+def _build_claims(payment_method: str, bridge_meta: Optional[dict] = None) -> dict:
+    """Construye el objeto claims que acompaña cada trail.
+    Describe qué ejecutó, qué wallet firmó, qué estaba mockeado.
+    Ref: propuesta @jd_openclaw — claim graph bajo la demo layer.
+    """
+    return {
+        "runtime": f"{SERVICE_NAME} v{SERVICE_VERSION}",
+        "wallet": "0xDcc84E9798E8eB1b1b48A31B8f35e5AA7b83DBF4",
+        "contract": bridge_meta.get("contract") if bridge_meta else None,
+        "payment_method": payment_method,
+        "mocked": [],
+        "impossible_effects": [
+            "agent_id spoofing (Ed25519 verified against giskard-marks)",
+            "double-spend (nonce cache, single-use per agent per call)",
+            "wallet substitution (giskard-signer vault AES-256-GCM, key never in LLM path)",
+        ],
+    }
+
+
 def _try_bridge_demo(amount_sats: int) -> dict:
     """Ejecuta el swap demo USDC→WETH en Base via bridge provider + giskard-signer.
     Retorna metadata dict para el trail. No lanza excepciones.
@@ -183,17 +203,13 @@ def _try_bridge_demo(amount_sats: int) -> dict:
         )
         if "error" in quote or quote.get("status") == "bridge_failed":
             return deframe_bridge.build_demo_metadata(
-                amount_sats=amount_sats,
-                quote=quote,
-                bridge_status="bridge_failed",
+                amount_sats=amount_sats, quote=quote, bridge_status="bridge_failed",
             )
 
         quote_id = quote.get("quoteId") or quote.get("id")
         if not quote_id:
             return deframe_bridge.build_demo_metadata(
-                amount_sats=amount_sats,
-                quote=quote,
-                bridge_status="bridge_failed",
+                amount_sats=amount_sats, quote=quote, bridge_status="bridge_failed",
             )
 
         bytecode_resp = deframe_bridge.get_swap_bytecode(
@@ -203,18 +219,14 @@ def _try_bridge_demo(amount_sats: int) -> dict:
         )
         if "error" in bytecode_resp or bytecode_resp.get("status") == "bridge_failed":
             return deframe_bridge.build_demo_metadata(
-                amount_sats=amount_sats,
-                quote=quote,
-                bridge_status="bridge_failed",
+                amount_sats=amount_sats, quote=quote, bridge_status="bridge_failed",
             )
 
         # bytecode_resp.transactionData es un array ordenado de txs (approve, swap, callback)
         tx_list = bytecode_resp.get("transactionData", [])
         if not tx_list:
             return deframe_bridge.build_demo_metadata(
-                amount_sats=amount_sats,
-                quote=quote,
-                bridge_status="bridge_failed",
+                amount_sats=amount_sats, quote=quote, bridge_status="bridge_failed",
             )
 
         chain_id = int(deframe_bridge.DEFAULT_CHAIN)
@@ -348,6 +360,9 @@ def enter_oasis(
                     bridge_meta = None
                     if payment_hash:
                         bridge_meta = _try_bridge_demo(karma)
+                    method = "lightning" if payment_hash else "arbitrum"
+                    claims = _build_claims(method, bridge_meta)
+                    trail_metadata = {**(bridge_meta or {}), "claims": claims}
                     mycelium_trails.record_trail(
                         TRAILS_DB,
                         agent_id=agent_id,
@@ -356,7 +371,7 @@ def enter_oasis(
                         nonce=nonce,
                         karma_at_time=karma,
                         success=True,
-                        metadata=bridge_meta,
+                        metadata=trail_metadata,
                     )
                 except Exception:
                     pass
@@ -400,6 +415,42 @@ async def status_rest():
         "healthy": bool(ANTHROPIC_API_KEY and PHOENIXD_PASSWORD),
         "dependencies": ["anthropic-api", "phoenixd", "arbitrum-rpc"],
     })
+
+
+@rest_app.get("/trails/verify")
+async def trails_verify(agent_id: str, action_ref: str):
+    """Verifica si un trail existe dado agent_id + action_ref canónico.
+
+    action_ref = SHA-256(agent_id:action_type:scope:timestamp).
+    Ver argentum-sdk/argentum/trails.py para compute_action_ref().
+
+    Retorna {verified, block, tx_hash, timestamp} — sin auth, sin rate limit agresivo.
+    Diseñado para que Sentinel/AgentShield consulten antes de mostrar 'verified by Mycelium'.
+    """
+    if not TRAILS_ENABLED:
+        raise HTTPException(status_code=404, detail="trails disabled")
+    agent_id = karma_pricing.sanitize_agent_id(agent_id)
+    trail = mycelium_trails.find_by_action_ref(TRAILS_DB, agent_id, action_ref)
+    if not trail:
+        return JSONResponse(
+            {"verified": False, "block": None, "tx_hash": None, "timestamp": None},
+            status_code=404,
+        )
+    import json as _json
+    from datetime import datetime, timezone
+    meta = trail.get("metadata") or {}
+    tx_hash = meta.get("bridge_tx_hash")
+    ts = trail["timestamp"]
+    ts_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
+    return {
+        "verified": True,
+        "block": None,
+        "tx_hash": tx_hash,
+        "timestamp": ts_iso,
+        "trail_id": trail["trail_id"],
+        "service": trail["service"],
+        "operation": trail["operation"],
+    }
 
 
 @rest_app.get("/trails/demo")
@@ -477,6 +528,62 @@ async def trails_count(agent_id: str):
     agent_id = karma_pricing.sanitize_agent_id(agent_id)
     n = mycelium_trails.count_trails_today(TRAILS_DB, agent_id)
     return {"agent_id": agent_id, "count_today": n}
+
+
+@rest_app.post("/agent/trail")
+async def agent_trail(request: Request):
+    """Genera un trail on-chain para un agente del ecosistema Mycelium.
+    Auth: firma Ed25519 registrada en giskard-marks. Sin pago Lightning —
+    la firma prueba identidad. El swap lo ejecuta giskard-signer (owner wallet).
+
+    Body JSON: {agent_id, signature, timestamp, nonce, state}
+    Retorna: {trail_id, bridge_tx_hash, bridge_status, karma}
+    """
+    if not TRAILS_ENABLED:
+        raise HTTPException(status_code=404, detail="trails disabled")
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    agent_id = karma_pricing.sanitize_agent_id(body.get("agent_id", ""))
+    signature = body.get("signature", "")
+    timestamp = body.get("timestamp", 0)
+    nonce = body.get("nonce", "")
+    state = body.get("state", "agent trail")
+
+    if not (agent_id and signature and timestamp and nonce):
+        return JSONResponse({"error": "agent_id, signature, timestamp, nonce required"}, status_code=400)
+
+    _, karma = karma_pricing.karma_discount(
+        agent_id, base_price=OASIS_PRICE_SATS,
+        signature=signature, timestamp=timestamp, nonce=nonce,
+    )
+    if karma == 0:
+        return JSONResponse({"error": "signature invalid or agent not registered"}, status_code=401)
+
+    bridge_meta = _try_bridge_demo(karma)
+    claims = _build_claims("agent_ed25519", bridge_meta)
+    trail_metadata = {**bridge_meta, "claims": claims}
+    trail_id = mycelium_trails.record_trail(
+        TRAILS_DB,
+        agent_id=agent_id,
+        service=SERVICE_NAME,
+        operation="agent_trail",
+        nonce=nonce,
+        karma_at_time=karma,
+        success=True,
+        metadata=trail_metadata,
+    )
+    return JSONResponse({
+        "trail_id": trail_id,
+        "agent_id": agent_id,
+        "karma": karma,
+        "bridge_tx_hash": bridge_meta.get("bridge_tx_hash"),
+        "bridge_status": bridge_meta.get("bridge_status"),
+        "bridge_error": bridge_meta.get("bridge_error"),
+        "amount_sats": bridge_meta.get("amount_sats"),
+    })
 
 
 @rest_app.post("/oasis")
