@@ -429,19 +429,29 @@ async def status_rest():
 
 
 @rest_app.get("/trails/verify")
-async def trails_verify(agent_id: str, action_ref: str):
-    """Verifica si un trail existe dado agent_id + action_ref canónico.
+async def trails_verify(
+    agent_id: Optional[str] = None,
+    action_ref: Optional[str] = None,
+    payment_hash: Optional[str] = None,
+):
+    """Verifica si un trail existe por action_ref o payment_hash.
 
-    action_ref = SHA-256(agent_id:action_type:scope:timestamp).
-    Ver argentum-sdk/argentum/trails.py para compute_action_ref().
+    - action_ref: SHA-256(agent_id:action_type:scope:timestamp). Requiere agent_id.
+    - payment_hash: receipt_id cross-rail (linking key en fixtures APS/stripe-issuing).
+      No requiere agent_id — el payment_hash es globalmente único.
 
-    Retorna {verified, block, tx_hash, timestamp} — sin auth, sin rate limit agresivo.
-    Diseñado para que Sentinel/AgentShield consulten antes de mostrar 'verified by Mycelium'.
+    Sin auth. Diseñado para verificación cross-rail y por Sentinel/AgentShield.
     """
     if not TRAILS_ENABLED:
         raise HTTPException(status_code=404, detail="trails disabled")
-    agent_id = karma_pricing.sanitize_agent_id(agent_id)
-    trail = mycelium_trails.find_by_action_ref(TRAILS_DB, agent_id, action_ref)
+    trail = None
+    if payment_hash:
+        trail = mycelium_trails.find_by_payment_hash(TRAILS_DB, payment_hash)
+    elif agent_id and action_ref:
+        agent_id = karma_pricing.sanitize_agent_id(agent_id)
+        trail = mycelium_trails.find_by_action_ref(TRAILS_DB, agent_id, action_ref)
+    else:
+        raise HTTPException(status_code=422, detail="provide action_ref+agent_id or payment_hash")
     if not trail:
         return JSONResponse(
             {"verified": False, "block": None, "tx_hash": None, "timestamp": None},
@@ -459,8 +469,11 @@ async def trails_verify(agent_id: str, action_ref: str):
         "tx_hash": tx_hash,
         "timestamp": ts_iso,
         "trail_id": trail["trail_id"],
+        "agent_id": trail["agent_id"],
         "service": trail["service"],
         "operation": trail["operation"],
+        "action_ref": trail.get("action_ref"),
+        "payment_hash": trail.get("payment_hash"),
     }
 
 

@@ -58,15 +58,19 @@ def compute_action_ref(agent_id: str, action_type: str, scope: str, timestamp: i
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
     """Aplica migraciones idempotentes post-DDL."""
-    for col, col_type in [("metadata", "TEXT"), ("action_ref", "TEXT")]:
+    for col, col_type in [("metadata", "TEXT"), ("action_ref", "TEXT"), ("payment_hash", "TEXT")]:
         try:
             conn.execute(f"ALTER TABLE trails ADD COLUMN {col} {col_type}")
         except Exception:
             pass
-    try:
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_trails_action_ref ON trails(action_ref)")
-    except Exception:
-        pass
+    for idx in [
+        "CREATE INDEX IF NOT EXISTS idx_trails_action_ref ON trails(action_ref)",
+        "CREATE INDEX IF NOT EXISTS idx_trails_payment_hash ON trails(payment_hash)",
+    ]:
+        try:
+            conn.execute(idx)
+        except Exception:
+            pass
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -126,11 +130,15 @@ def record_trail(
     genesis_agents: Iterable[str] = GENESIS_AGENTS_DEFAULT,
     now: Optional[int] = None,
     metadata: Optional[dict] = None,
+    action_ref_override: Optional[str] = None,
+    payment_hash: Optional[str] = None,
 ) -> Optional[str]:
     """Graba un trail. Retorna trail_id o None si cae por rate limit o input invalido.
 
     Precondicion: la firma Ed25519 ya fue verificada por el caller.
-    action_ref se computa automáticamente de (agent_id, operation, service, timestamp).
+    action_ref se computa automáticamente salvo que se pase action_ref_override
+    (para trails externos como cross-rail fixtures donde el action_ref viene del emisor).
+    payment_hash es el linking key cross-rail (= receipt_id en fixtures APS/stripe-issuing).
     """
     if not (agent_id and service and operation and nonce):
         return None
@@ -145,15 +153,15 @@ def record_trail(
     trail_id = str(uuid.uuid4())
     ts = int(now if now is not None else time.time())
     metadata_str = _json.dumps(metadata) if metadata else None
-    action_ref = compute_action_ref(agent_id, operation, service, ts)
+    action_ref = action_ref_override or compute_action_ref(agent_id, operation, service, ts)
     conn = _connect(db_path)
     try:
         conn.execute(
             """
             INSERT INTO trails
               (trail_id, agent_id, service, operation, timestamp,
-               karma_at_time, success, signature_ref, metadata, action_ref)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               karma_at_time, success, signature_ref, metadata, action_ref, payment_hash)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trail_id,
@@ -166,6 +174,7 @@ def record_trail(
                 _sig_ref(nonce),
                 metadata_str,
                 action_ref,
+                payment_hash,
             ),
         )
         return trail_id
@@ -175,14 +184,12 @@ def record_trail(
 
 def _row_to_dict(row: sqlite3.Row) -> dict:
     import json as _json
-    try:
-        meta_raw = row["metadata"]
-    except (IndexError, KeyError):
-        meta_raw = None
-    try:
-        action_ref = row["action_ref"]
-    except (IndexError, KeyError):
-        action_ref = None
+    def _safe(col):
+        try:
+            return row[col]
+        except (IndexError, KeyError):
+            return None
+    meta_raw = _safe("metadata")
     return {
         "trail_id": row["trail_id"],
         "agent_id": row["agent_id"],
@@ -192,7 +199,8 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
         "karma_at_time": row["karma_at_time"],
         "success": bool(row["success"]),
         "signature_ref": row["signature_ref"],
-        "action_ref": action_ref,
+        "action_ref": _safe("action_ref"),
+        "payment_hash": _safe("payment_hash"),
         "metadata": _json.loads(meta_raw) if meta_raw else None,
     }
 
@@ -208,13 +216,36 @@ def find_by_action_ref(
         row = conn.execute(
             """
             SELECT trail_id, agent_id, service, operation, timestamp,
-                   karma_at_time, success, signature_ref, metadata, action_ref
+                   karma_at_time, success, signature_ref, metadata, action_ref, payment_hash
             FROM trails
             WHERE agent_id=? AND action_ref=?
             ORDER BY timestamp DESC
             LIMIT 1
             """,
             (agent_id, action_ref),
+        ).fetchone()
+        return _row_to_dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def find_by_payment_hash(
+    db_path: str,
+    payment_hash: str,
+) -> Optional[dict]:
+    """Lookup por payment_hash (= receipt_id en cross-rail fixtures). Retorna el trail o None."""
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT trail_id, agent_id, service, operation, timestamp,
+                   karma_at_time, success, signature_ref, metadata, action_ref, payment_hash
+            FROM trails
+            WHERE payment_hash=?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (payment_hash,),
         ).fetchone()
         return _row_to_dict(row) if row else None
     finally:
