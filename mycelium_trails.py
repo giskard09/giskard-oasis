@@ -314,8 +314,15 @@ def list_trails_by_service(
         conn.close()
 
 
-def update_trail_anchor(db_path: str, trail_id: str, anchor_tx_hash: str, anchor_block: int) -> bool:
-    """Guarda anchor_tx_hash y anchor_block en metadata de un trail existente."""
+def update_trail_anchor(
+    db_path: str,
+    trail_id: str,
+    anchor_tx_hash: str,
+    anchor_block: int,
+    tx_key: str = "anchor_tx_hash",
+    block_key: str = "anchor_block",
+) -> bool:
+    """Guarda anchor tx_hash y block en metadata. Keys configurables por cadena."""
     import json as _json
     conn = _connect(db_path)
     try:
@@ -325,8 +332,8 @@ def update_trail_anchor(db_path: str, trail_id: str, anchor_tx_hash: str, anchor
         if not row:
             return False
         meta = _json.loads(row[0]) if row[0] else {}
-        meta["anchor_tx_hash"] = anchor_tx_hash
-        meta["anchor_block"] = anchor_block
+        meta[tx_key] = anchor_tx_hash
+        meta[block_key] = anchor_block
         conn.execute(
             "UPDATE trails SET metadata=? WHERE trail_id=?",
             (_json.dumps(meta), trail_id),
