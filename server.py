@@ -460,14 +460,22 @@ async def trails_verify(
     import json as _json
     from datetime import datetime, timezone
     meta = trail.get("metadata") or {}
-    anchor_tx = meta.get("anchor_tx_hash") or meta.get("bridge_tx_hash")
-    anchor_block = meta.get("anchor_block")
+    arb_tx = meta.get("anchor_tx_hash") or meta.get("bridge_tx_hash")
+    arb_block = meta.get("anchor_block")
+    base_tx = meta.get("anchor_base_tx_hash")
+    base_block = meta.get("anchor_base_block")
     ts = trail["timestamp"]
     ts_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
+    anchors = {}
+    if arb_tx or arb_block:
+        anchors["arbitrum"] = {"block": arb_block, "tx_hash": arb_tx, "chain_id": 42161}
+    if base_tx or base_block:
+        anchors["base"] = {"block": base_block, "tx_hash": base_tx, "chain_id": 8453}
     return {
         "verified": True,
-        "block": anchor_block,
-        "tx_hash": anchor_tx,
+        "block": arb_block,
+        "tx_hash": arb_tx,
+        "anchors": anchors or None,
         "timestamp": ts_iso,
         "trail_id": trail["trail_id"],
         "agent_id": trail["agent_id"],
