@@ -460,13 +460,14 @@ async def trails_verify(
     import json as _json
     from datetime import datetime, timezone
     meta = trail.get("metadata") or {}
-    tx_hash = meta.get("bridge_tx_hash")
+    anchor_tx = meta.get("anchor_tx_hash") or meta.get("bridge_tx_hash")
+    anchor_block = meta.get("anchor_block")
     ts = trail["timestamp"]
     ts_iso = datetime.fromtimestamp(ts, tz=timezone.utc).isoformat() if ts else None
     return {
         "verified": True,
-        "block": None,
-        "tx_hash": tx_hash,
+        "block": anchor_block,
+        "tx_hash": anchor_tx,
         "timestamp": ts_iso,
         "trail_id": trail["trail_id"],
         "agent_id": trail["agent_id"],
@@ -475,6 +476,94 @@ async def trails_verify(
         "action_ref": trail.get("action_ref"),
         "payment_hash": trail.get("payment_hash"),
     }
+
+
+def _anchor_trail_onchain(trail_id: str, payment_hash: str) -> tuple[str, int]:
+    """Envía self-tx en Arbitrum con calldata = keccak256(trail_id:payment_hash).
+    Devuelve (tx_hash, block_number). Usa giskard-signer (sin exponer key al LLM)."""
+    import hashlib
+    from web3 import Web3 as _Web3
+    ARBRPC = os.environ.get("ARBITRUM_RPC", "https://arb1.arbitrum.io/rpc")
+    w3 = _Web3(_Web3.HTTPProvider(ARBRPC))
+    signer = _SignerClient()
+    owner = _Web3.to_checksum_address(signer.get_address("owner"))
+    payload = hashlib.sha256(f"{trail_id}:{payment_hash}".encode()).digest()
+    latest = w3.eth.get_block("latest")
+    base_fee = latest.get("baseFeePerGas", 20_000_000)
+    max_fee = base_fee * 2 + 1_000_000  # 2x buffer + 1 gwei priority
+    tx = {
+        "to": owner,
+        "value": 0,
+        "data": "0x" + payload.hex(),
+        "chainId": 42161,
+        "maxFeePerGas": max_fee,
+        "maxPriorityFeePerGas": 1_000_000,
+    }
+    tx_hash = signer.send_transaction("owner", tx, chain_id=42161)
+    for _ in range(60):
+        try:
+            receipt = w3.eth.get_transaction_receipt(tx_hash)
+            if receipt:
+                return tx_hash, receipt["blockNumber"]
+        except Exception:
+            pass
+        import time as _time
+        _time.sleep(2)
+    raise TimeoutError(f"receipt not found for {tx_hash}")
+
+
+@rest_app.post("/trails/anchor")
+async def trails_anchor(request: Request):
+    """Ancora trails pendientes en Arbitrum. Admin-only (ADMIN_KEY header).
+    Body: {"trail_ids": ["...", ...]}  o  {"payment_hashes": ["...", ...]}
+    Devuelve lista de {trail_id, tx_hash, block, ok}."""
+    if not TRAILS_ENABLED:
+        raise HTTPException(status_code=404, detail="trails disabled")
+    admin_key = os.environ.get("ADMIN_KEY", "")
+    if admin_key and request.headers.get("X-Admin-Key") != admin_key:
+        raise HTTPException(status_code=403, detail="forbidden")
+    body = await request.json()
+    trail_ids = body.get("trail_ids") or []
+    payment_hashes = body.get("payment_hashes") or []
+    if payment_hashes:
+        for ph in payment_hashes:
+            t = mycelium_trails.find_by_payment_hash(TRAILS_DB, ph)
+            if t:
+                trail_ids.append(t["trail_id"])
+    if not trail_ids:
+        raise HTTPException(status_code=422, detail="provide trail_ids or payment_hashes")
+    results = []
+    for tid in trail_ids:
+        trail = None
+        import sqlite3 as _sq3
+        conn = _sq3.connect(TRAILS_DB)
+        conn.row_factory = _sq3.Row
+        row = conn.execute(
+            "SELECT trail_id, payment_hash, metadata FROM trails WHERE trail_id=?", (tid,)
+        ).fetchone()
+        conn.close()
+        if not row:
+            results.append({"trail_id": tid, "ok": False, "error": "not found"})
+            continue
+        import json as _json
+        meta = _json.loads(row["metadata"]) if row["metadata"] else {}
+        if meta.get("anchor_block"):
+            results.append({
+                "trail_id": tid,
+                "ok": True,
+                "tx_hash": meta["anchor_tx_hash"],
+                "block": meta["anchor_block"],
+                "skipped": True,
+            })
+            continue
+        ph = row["payment_hash"] or ""
+        try:
+            tx_hash, block = _anchor_trail_onchain(tid, ph)
+            mycelium_trails.update_trail_anchor(TRAILS_DB, tid, tx_hash, block)
+            results.append({"trail_id": tid, "ok": True, "tx_hash": tx_hash, "block": block})
+        except Exception as exc:
+            results.append({"trail_id": tid, "ok": False, "error": str(exc)})
+    return {"anchored": results}
 
 
 @rest_app.get("/trails/demo")
