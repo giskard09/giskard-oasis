@@ -14,6 +14,7 @@ import arb_pay
 import karma_pricing
 import mycelium_trails
 import deframe_bridge
+import trail_fees
 import sys as _sys
 _sys.path.insert(0, "/home/dell7568/giskard-signer")
 from signer.client import SignerClient as _SignerClient
@@ -665,11 +666,14 @@ async def trails_count(agent_id: str):
 @rest_app.post("/agent/trail")
 async def agent_trail(request: Request):
     """Genera un trail on-chain para un agente del ecosistema Mycelium.
-    Auth: firma Ed25519 registrada en giskard-marks. Sin pago Lightning —
-    la firma prueba identidad. El swap lo ejecuta giskard-signer (owner wallet).
+    Auth: firma Ed25519 registrada en giskard-marks.
 
-    Body JSON: {agent_id, signature, timestamp, nonce, state}
-    Retorna: {trail_id, bridge_tx_hash, bridge_status, karma}
+    Cobro: si TRAIL_FEES_ENABLED=true y el agente no es interno ni integrador
+    dentro del free tier, retorna invoice LN. El agente paga y reinvoca con
+    payment_hash para confirmar el trail.
+
+    Body JSON: {agent_id, signature, timestamp, nonce, state, payment_hash?}
+    Retorna: {trail_id, ...} o {payment_required: true, payment_request, payment_hash}
     """
     if not TRAILS_ENABLED:
         raise HTTPException(status_code=404, detail="trails disabled")
@@ -683,6 +687,7 @@ async def agent_trail(request: Request):
     timestamp = body.get("timestamp", 0)
     nonce = body.get("nonce", "")
     state = body.get("state", "agent trail")
+    payment_hash = body.get("payment_hash", "")
 
     if not (agent_id and signature and timestamp and nonce):
         return JSONResponse({"error": "agent_id, signature, timestamp, nonce required"}, status_code=400)
@@ -693,6 +698,24 @@ async def agent_trail(request: Request):
     )
     if karma == 0:
         return JSONResponse({"error": "signature invalid or agent not registered"}, status_code=401)
+
+    # --- Fee gate ---
+    fee_sats = trail_fees.trail_fee_required(agent_id, karma, TRAILS_DB)
+    if fee_sats is not None:
+        if not payment_hash:
+            # Primer llamado: generar invoice y pedir pago
+            invoice = create_invoice(fee_sats, f"Mycelium trail — {agent_id}")
+            return JSONResponse({
+                "payment_required": True,
+                "fee_sats": fee_sats,
+                "payment_request": invoice["payment_request"],
+                "payment_hash": invoice["payment_hash"],
+                "instructions": "Pay the invoice and re-call with payment_hash to register the trail.",
+            }, status_code=402)
+        # Segundo llamado: verificar pago
+        if not check_invoice(payment_hash):
+            return JSONResponse({"error": "Invoice not settled. Pay and retry with payment_hash."}, status_code=402)
+    # --- Fin fee gate ---
 
     bridge_meta = _try_bridge_demo(karma)
     claims = _build_claims("agent_ed25519", bridge_meta)
@@ -706,16 +729,83 @@ async def agent_trail(request: Request):
         karma_at_time=karma,
         success=True,
         metadata=trail_metadata,
+        payment_hash=payment_hash or None,
     )
     return JSONResponse({
         "trail_id": trail_id,
         "agent_id": agent_id,
         "karma": karma,
+        "fee_sats_paid": fee_sats,
         "bridge_tx_hash": bridge_meta.get("bridge_tx_hash"),
         "bridge_status": bridge_meta.get("bridge_status"),
         "bridge_error": bridge_meta.get("bridge_error"),
         "amount_sats": bridge_meta.get("amount_sats"),
     })
+
+
+@rest_app.get("/trails/revenue")
+async def trails_revenue():
+    """Revenue generado por trail fees — hoy / semana / mes.
+    Desglose por agent_id. Sirve como baseline para Legales.
+    """
+    import sqlite3 as _sql, time as _time
+    now = int(_time.time())
+    day_start   = now - 86_400
+    week_start  = now - 7 * 86_400
+    month_start = now - 30 * 86_400
+
+    conn = _sql.connect(TRAILS_DB)
+    conn.row_factory = _sql.Row
+
+    def _count_and_fee(since: int) -> dict:
+        rows = conn.execute(
+            "SELECT agent_id, COUNT(*) as n FROM trails "
+            "WHERE timestamp>=? AND payment_hash IS NOT NULL AND payment_hash != '' "
+            "GROUP BY agent_id ORDER BY n DESC",
+            (since,),
+        ).fetchall()
+        total = sum(r["n"] for r in rows)
+        # Approximation: each paid trail = TRAIL_FEE_SATS (exact depends on karma)
+        return {
+            "trails_paid": total,
+            "sats_collected_approx": total * trail_fees.TRAIL_FEE_SATS,
+            "by_agent": [{"agent_id": r["agent_id"], "trails": r["n"]} for r in rows],
+        }
+
+    data = {
+        "today":  _count_and_fee(day_start),
+        "week":   _count_and_fee(week_start),
+        "month":  _count_and_fee(month_start),
+        "fees_enabled": trail_fees.TRAIL_FEES_ENABLED,
+        "fee_sats": trail_fees.TRAIL_FEE_SATS,
+        "exempt_agents": list(trail_fees.EXEMPT_AGENTS),
+        "integrator_whitelist": trail_fees.INTEGRATOR_FREE_TIERS,
+    }
+    conn.close()
+    return JSONResponse(data)
+
+
+@rest_app.post("/trails/whitelist")
+async def trails_whitelist(request: Request):
+    """Agrega o elimina un integrador del free tier (solo creador).
+    Body: {agent_id, action: 'add'|'remove', daily_cap?: int}
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    agent_id = body.get("agent_id", "").strip()
+    action = body.get("action", "add")
+    daily_cap = int(body.get("daily_cap", 100))
+    if not agent_id:
+        return JSONResponse({"error": "agent_id required"}, status_code=400)
+    if action == "add":
+        trail_fees.add_to_whitelist(agent_id, daily_cap)
+        return JSONResponse({"status": "added", "agent_id": agent_id, "daily_cap": daily_cap})
+    elif action == "remove":
+        trail_fees.remove_from_whitelist(agent_id)
+        return JSONResponse({"status": "removed", "agent_id": agent_id})
+    return JSONResponse({"error": "action must be 'add' or 'remove'"}, status_code=400)
 
 
 @rest_app.post("/oasis")
