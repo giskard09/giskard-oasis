@@ -51,6 +51,10 @@ def compute_action_ref(agent_id: str, action_type: str, scope: str, timestamp: i
 
     Misma función que argentum-sdk/argentum/trails.py — mantener en sync.
     Callers externos pueden pre-generar el mismo hash antes de que el trail exista.
+
+    Wire format interno: timestamp es Unix epoch en segundos (int64).
+    Capa API/crosswalk (aeoess, AGT #2244): timestamp_ms = timestamp * 1000 (int64 big-endian)
+    o RFC 3339 string. Son capas distintas — el hash se computa sobre el int de segundos.
     """
     payload = f"{agent_id}:{action_type}:{scope}:{int(timestamp)}"
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -190,18 +194,29 @@ def _row_to_dict(row: sqlite3.Row) -> dict:
         except (IndexError, KeyError):
             return None
     meta_raw = _safe("metadata")
+    ts = row["timestamp"]
     return {
         "trail_id": row["trail_id"],
         "agent_id": row["agent_id"],
         "service": row["service"],
         "operation": row["operation"],
-        "timestamp": row["timestamp"],
+        "timestamp": ts,
         "karma_at_time": row["karma_at_time"],
         "success": bool(row["success"]),
         "signature_ref": row["signature_ref"],
         "action_ref": _safe("action_ref"),
         "payment_hash": _safe("payment_hash"),
         "metadata": _json.loads(meta_raw) if meta_raw else None,
+        # Preimage fields: los 4 inputs que producen action_ref.
+        # Publicados junto al record para que callers externos puedan
+        # verificar el hash sin confiar en nuestra implementación (full_replay).
+        # timestamp_ms = timestamp * 1000 (int64 big-endian en wire cross-rail).
+        "preimage": {
+            "agent_id": row["agent_id"],
+            "action_type": row["operation"],
+            "scope": row["service"],
+            "timestamp_ms": ts * 1000 if ts is not None else None,
+        },
     }
 
 
