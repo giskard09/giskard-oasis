@@ -23,6 +23,7 @@ from typing import Iterable, Optional
 GENESIS_AGENTS_DEFAULT = frozenset({"giskard-self", "lightning"})
 RATE_LIMIT_DEFAULT = 100
 MAX_LIMIT_PER_QUERY = 500
+MONTHLY_LIMIT_FREE  = 1_000   # Free tier: trails por calendar month
 
 _DDL = [
     """
@@ -43,6 +44,14 @@ _DDL = [
     "CREATE INDEX IF NOT EXISTS idx_trails_agent ON trails(agent_id, timestamp DESC)",
     "CREATE INDEX IF NOT EXISTS idx_trails_service_time ON trails(service, timestamp DESC)",
     "CREATE INDEX IF NOT EXISTS idx_trails_action_ref ON trails(action_ref)",
+    """
+    CREATE TABLE IF NOT EXISTS monthly_usage (
+        agent_id    TEXT NOT NULL,
+        year_month  TEXT NOT NULL,   -- 'YYYY-MM'
+        trail_count INTEGER DEFAULT 0,
+        PRIMARY KEY (agent_id, year_month)
+    )
+    """,
 ]
 
 
@@ -75,6 +84,15 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             conn.execute(idx)
         except Exception:
             pass
+    # monthly_usage table (backfill para DBs existentes)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS monthly_usage (
+            agent_id    TEXT NOT NULL,
+            year_month  TEXT NOT NULL,
+            trail_count INTEGER DEFAULT 0,
+            PRIMARY KEY (agent_id, year_month)
+        )
+    """)
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
@@ -105,6 +123,42 @@ def _start_of_day_ts(now: Optional[int] = None) -> int:
     return t - (t % 86400)
 
 
+def _year_month(now: Optional[int] = None) -> str:
+    """Retorna 'YYYY-MM' para el timestamp dado (o ahora)."""
+    t = now if now is not None else int(time.time())
+    dt = datetime.fromtimestamp(t, tz=timezone.utc)
+    return dt.strftime("%Y-%m")
+
+
+def count_trails_this_month(
+    db_path: str,
+    agent_id: str,
+    now: Optional[int] = None,
+) -> int:
+    """Retorna el número de trails del agent_id en el calendar month actual."""
+    ym = _year_month(now)
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT trail_count FROM monthly_usage WHERE agent_id=? AND year_month=?",
+            (agent_id, ym),
+        ).fetchone()
+        return int(row["trail_count"]) if row else 0
+    finally:
+        conn.close()
+
+
+def _increment_monthly_usage(conn: sqlite3.Connection, agent_id: str, ym: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO monthly_usage (agent_id, year_month, trail_count)
+        VALUES (?, ?, 1)
+        ON CONFLICT(agent_id, year_month) DO UPDATE SET trail_count = trail_count + 1
+        """,
+        (agent_id, ym),
+    )
+
+
 def count_trails_today(
     db_path: str,
     agent_id: str,
@@ -122,6 +176,9 @@ def count_trails_today(
         conn.close()
 
 
+MONTHLY_LIMIT_EXCEEDED = "MONTHLY_LIMIT_EXCEEDED"
+
+
 def record_trail(
     db_path: str,
     agent_id: str,
@@ -131,31 +188,42 @@ def record_trail(
     karma_at_time: Optional[int] = None,
     success: bool = True,
     rate_limit_cap: int = RATE_LIMIT_DEFAULT,
+    monthly_limit: int = MONTHLY_LIMIT_FREE,
     genesis_agents: Iterable[str] = GENESIS_AGENTS_DEFAULT,
     now: Optional[int] = None,
     metadata: Optional[dict] = None,
     action_ref_override: Optional[str] = None,
     payment_hash: Optional[str] = None,
 ) -> Optional[str]:
-    """Graba un trail. Retorna trail_id o None si cae por rate limit o input invalido.
+    """Graba un trail. Retorna trail_id o None si cae por input inválido.
+
+    Retorna MONTHLY_LIMIT_EXCEEDED (sentinel string) si el agente superó
+    el límite mensual — permite que el caller devuelva un mensaje de upgrade.
 
     Precondicion: la firma Ed25519 ya fue verificada por el caller.
-    action_ref se computa automáticamente salvo que se pase action_ref_override
-    (para trails externos como cross-rail fixtures donde el action_ref viene del emisor).
-    payment_hash es el linking key cross-rail (= receipt_id en fixtures APS/stripe-issuing).
+    action_ref se computa automáticamente salvo que se pase action_ref_override.
+    payment_hash es el linking key cross-rail.
     """
     if not (agent_id and service and operation and nonce):
         return None
 
     genesis = frozenset(genesis_agents)
-    if agent_id not in genesis and rate_limit_cap > 0:
-        used = count_trails_today(db_path, agent_id, now=now)
-        if used >= rate_limit_cap:
-            return None
+    if agent_id not in genesis:
+        # Rate limit diario
+        if rate_limit_cap > 0:
+            used_today = count_trails_today(db_path, agent_id, now=now)
+            if used_today >= rate_limit_cap:
+                return None
+        # Rate limit mensual — Free tier
+        if monthly_limit > 0:
+            used_month = count_trails_this_month(db_path, agent_id, now=now)
+            if used_month >= monthly_limit:
+                return MONTHLY_LIMIT_EXCEEDED
 
     import json as _json
     trail_id = str(uuid.uuid4())
     ts = int(now if now is not None else time.time())
+    ym = _year_month(ts)
     metadata_str = _json.dumps(metadata) if metadata else None
     action_ref = action_ref_override or compute_action_ref(agent_id, operation, service, ts)
     conn = _connect(db_path)
@@ -181,6 +249,7 @@ def record_trail(
                 payment_hash,
             ),
         )
+        _increment_monthly_usage(conn, agent_id, ym)
         return trail_id
     finally:
         conn.close()
