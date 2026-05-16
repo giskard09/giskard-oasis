@@ -81,6 +81,17 @@ mcp._custom_starlette_routes.append(_StarletteRoute("/status", _status_handler))
 
 async def _oasis_x402_proxy(request: _StarletteRequest):
     """Proxy /oasis → localhost:8003/oasis, preserving x402 headers and 402 responses."""
+    from starlette.responses import Response as _StarletteResponse
+    if request.method == "OPTIONS":
+        return _StarletteResponse(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+                "Access-Control-Allow-Headers": "content-type, x-payment, x-payment-response",
+                "Access-Control-Max-Age": "600",
+            },
+        )
     body = await request.body()
     forward_headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
     forward_headers["X-Forwarded-Host"] = "oasis.rgiskard.xyz"
@@ -92,14 +103,13 @@ async def _oasis_x402_proxy(request: _StarletteRequest):
             headers=forward_headers,
             content=body,
         )
-    from starlette.responses import Response as _StarletteResponse
     return _StarletteResponse(
         content=resp.content,
         status_code=resp.status_code,
         headers=dict(resp.headers),
     )
 
-mcp._custom_starlette_routes.append(_StarletteRoute("/oasis", _oasis_x402_proxy, methods=["POST", "GET"]))
+mcp._custom_starlette_routes.append(_StarletteRoute("/oasis", _oasis_x402_proxy, methods=["POST", "GET", "OPTIONS"]))
 
 
 async def _well_known_x402(request: _StarletteRequest):
