@@ -20,11 +20,13 @@ _sys.path.insert(0, "/home/dell7568/giskard-signer")
 from signer.client import SignerClient as _SignerClient
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from x402.http.middleware.fastapi import PaymentMiddlewareASGI
 from x402.http import HTTPFacilitatorClient, FacilitatorConfig, PaymentOption
 from x402.http.types import RouteConfig
 from x402.server import x402ResourceServer
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 import uvicorn
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -32,6 +34,7 @@ PHOENIXD_PASSWORD = os.getenv("PHOENIXD_PASSWORD")
 PHOENIXD_URL = "http://127.0.0.1:9740"
 OASIS_PRICE_SATS = 21
 OASIS_WALLET = "0xdcc84e9798e8eb1b1b48a31b8f35e5aa7b83dbf4"
+OASIS_PUBLIC_URL = "https://oasis.rgiskard.xyz/oasis"
 
 TRAILS_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trails.db")
 TRAILS_ENABLED = os.getenv("MYCELIUM_TRAILS_ENABLED", "true").lower() != "false"
@@ -74,6 +77,69 @@ async def _status_handler(request: _StarletteRequest):
     }, headers={"Access-Control-Allow-Origin": "*"})
 
 mcp._custom_starlette_routes.append(_StarletteRoute("/status", _status_handler))
+
+
+async def _oasis_x402_proxy(request: _StarletteRequest):
+    """Proxy /oasis → localhost:8003/oasis, preserving x402 headers and 402 responses."""
+    body = await request.body()
+    forward_headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+    forward_headers["X-Forwarded-Host"] = "oasis.rgiskard.xyz"
+    forward_headers["X-Forwarded-Proto"] = "https"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.request(
+            method=request.method,
+            url="http://localhost:8003/oasis",
+            headers=forward_headers,
+            content=body,
+        )
+    from starlette.responses import Response as _StarletteResponse
+    return _StarletteResponse(
+        content=resp.content,
+        status_code=resp.status_code,
+        headers=dict(resp.headers),
+    )
+
+mcp._custom_starlette_routes.append(_StarletteRoute("/oasis", _oasis_x402_proxy, methods=["POST", "GET"]))
+
+
+async def _well_known_x402(request: _StarletteRequest):
+    """x402 service discovery endpoint for Bazaar/Agentic.Market/Ampersend auto-indexing."""
+    return _StarletteJSON({
+        "x402Version": 2,
+        "resource": {
+            "url": "https://oasis.rgiskard.xyz/oasis",
+            "description": "Context clarity for agents in fog. POST your agent state, receive a Claude-powered insight. Every call anchors a tamper-evident TrailRecord on Base mainnet.",
+            "mimeType": "application/json",
+        },
+        "accepts": [{
+            "scheme": "exact",
+            "network": "eip155:84532",
+            "asset": "0x036CbD53842c54266634e7929541eC2318f3dCF7e",
+            "amount": "1000",
+            "payTo": OASIS_WALLET,
+            "maxTimeoutSeconds": 300,
+            "extra": {"name": "USDC", "version": "2"},
+        }],
+        "extensions": {
+            "bazaar": {
+                "info": {
+                    "input": {
+                        "type": "http",
+                        "bodyType": "json",
+                        "body": {"state": "describe your agent's current situation"},
+                        "method": "POST",
+                    },
+                    "output": {
+                        "type": "json",
+                        "example": {"clarity": "Based on your state, the next action is..."},
+                    },
+                },
+            },
+        },
+    }, headers={"Access-Control-Allow-Origin": "*"})
+
+mcp._custom_starlette_routes.append(_StarletteRoute("/.well-known/x402", _well_known_x402))
+
 
 
 @mcp.tool()
@@ -395,6 +461,8 @@ def enter_oasis(
 
 rest_app = FastAPI(title="Giskard Oasis REST")
 
+rest_app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+
 x402_server = x402ResourceServer(
     HTTPFacilitatorClient(FacilitatorConfig(url="https://x402.org/facilitator"))
 )
@@ -402,18 +470,29 @@ x402_server.register("eip155:84532", ExactEvmServerScheme())  # Base Sepolia tes
 
 routes = {
     "POST /oasis": RouteConfig(
+        resource=OASIS_PUBLIC_URL,
         accepts=[
             PaymentOption(
                 scheme="exact",
                 price="$0.001",
                 network="eip155:84532",
                 pay_to=OASIS_WALLET,
+                extra={"resource": OASIS_PUBLIC_URL},
             )
         ]
     )
 }
 
 rest_app.add_middleware(PaymentMiddlewareASGI, routes=routes, server=x402_server)
+
+# CORS wraps payment middleware so 402 responses also carry Access-Control headers
+rest_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["Content-Type", "X-PAYMENT", "X-Payment-Response"],
+    expose_headers=["X-Payment-Response"],
+)
 
 
 @rest_app.get("/status")
